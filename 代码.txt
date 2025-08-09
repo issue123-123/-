@@ -1,0 +1,251 @@
+#' @title 生成刀切法重要性图
+#'
+#' @description 该函数读取刀切法分析结果CSV文件，创建显示变量重要性的柱状图。
+#'
+#' @param file_path CSV文件路径
+#' @param title 图表标题（默认为"刀切法"）
+#'
+#' @return ggplot对象
+#' @importFrom dplyr filter mutate case_when rename if_else
+#' @importFrom tidyr pivot_longer pivot_wider
+#' @importFrom ggplot2 ggplot geom_col scale_fill_manual scale_x_continuous labs theme_bw theme element_line element_text element_rect unit margin guide_legend expansion
+#' @importFrom magrittr %>%
+#' @export
+
+#' @title 生成刀切法重要性图
+#'
+#' @description 该函数读取刀切法分析结果CSV文件，创建显示变量重要性的柱状图，并可选择保存为TIFF格式图片。
+#'
+#' @param file_path CSV文件路径
+#' @param title 图表标题（默认为"刀切法"）
+#' @param save_plot 是否保存图片（默认为FALSE）
+#' @param output_file 输出图片文件路径（当save_plot=TRUE时必需）
+#'
+#' @return ggplot对象
+#' @importFrom dplyr filter mutate case_when rename if_else
+#' @importFrom tidyr pivot_longer pivot_wider
+#' @importFrom ggplot2 ggplot geom_col scale_fill_manual scale_x_continuous labs theme_bw theme element_line element_text element_rect unit margin guide_legend expansion ggsave
+#' @importFrom magrittr %>%
+#' @export
+
+knife_plot <- function(file_path, title = "刀切法", save_plot = FALSE, output_file = NULL) {
+
+  # 验证包依赖
+  required_pkgs <- c("dplyr", "tidyr", "ggplot2", "magrittr", "scales", "readr", "stringr")
+  check_packages(required_pkgs)
+
+  # 读取数据 - 处理BOM
+  if (!file.exists(file_path)) {
+    stop("找不到文件: ", file_path)
+  }
+
+  # 尝试读取文件
+  data <- tryCatch({
+    read.csv(file_path, fileEncoding = "UTF-8-BOM")
+  }, error = function(e) {
+    # 尝试不指定编码读取
+    tryCatch({
+      read.csv(file_path)
+    }, error = function(e2) {
+      # 尝试使用readr读取
+      readr::read_csv(file_path)
+    })
+  })
+
+  # 打印数据预览
+  message("CSV文件内容预览:")
+  print(head(data))
+
+  # 检查列名
+  if (!"variable" %in% colnames(data)) {
+    stop("CSV文件必须包含 'variable' 列")
+  }
+
+  # 数据转换 - 更健壮的列名处理
+  tryCatch({
+    # 第一步：将数据从宽格式转换为长格式
+    long_step1 <- data %>%
+      tidyr::pivot_longer(
+        cols = -variable,
+        names_to = "bio",
+        values_to = "value"
+      )
+
+    # 第二步：将数据从长格式转换为宽格式，但转置
+    wide_step <- long_step1 %>%
+      tidyr::pivot_wider(
+        names_from = variable,
+        values_from = value
+      )
+
+    # 第三步：重命名列
+    # 使用模糊匹配来处理列名变体
+    col_names <- colnames(wide_step)
+
+    without_col <- grep("Without", col_names, value = TRUE, ignore.case = TRUE)
+    with_only_col <- grep("With.only|With_only", col_names, value = TRUE, ignore.case = TRUE)
+
+    if (length(without_col) == 0 || length(with_only_col) == 0) {
+      stop("无法识别 'Without variable' 和 'With only variable' 列")
+    }
+
+    # 重命名列
+    wide_step <- wide_step %>%
+      dplyr::rename(
+        Without = !!without_col[1],
+        With_only = !!with_only_col[1]
+      )
+
+    # 第四步：将数据从宽格式转换为长格式
+    long_data <- wide_step %>%
+      tidyr::pivot_longer(
+        cols = c(Without, With_only),
+        names_to = "category",
+        values_to = "value"
+      ) %>%
+      dplyr::mutate(
+        color_group = dplyr::case_when(
+          category == "Without" & bio == "With.all.variables" ~ "With.all.variables",
+          category == "Without" ~ "Without",
+          TRUE ~ "With_only"
+        ),
+        position = dplyr::if_else(category == "Without", -0.15, 0.15)
+      )
+  }, error = function(e) {
+    stop("数据处理错误: ", e$message)
+  })
+
+  # === 修改：设置y轴顺序 ===
+  # 识别"With.all.variables"的变体名称
+  all_vars <- grep("with.*all", unique(long_data$bio), value = TRUE, ignore.case = TRUE)
+  if (length(all_vars) == 0) {
+    stop("无法识别 'With.all.variables' 列")
+  }
+  all_var_name <- all_vars[1]
+
+  # 获取所有生物变量（bio1到bio19）
+  bio_vars <- grep("^bio\\d+$", unique(long_data$bio), value = TRUE)
+
+  # 按数字顺序排序生物变量 (bio1, bio2, ... bio19) -> 从小到大
+  bio_vars_sorted <- bio_vars[order(as.numeric(gsub("bio", "", bio_vars)))]
+
+  # 设置因子水平：bio1在顶部，bio19在中间，With all variables在底部
+  bio_order <- c(rev(bio_vars_sorted), all_var_name)
+
+  long_data$bio <- factor(long_data$bio, levels = bio_order)
+  # === 修改结束 ==
+  long_data <- long_data %>%
+    dplyr::mutate(
+      color_group = dplyr::case_when(
+        category == "Without" & bio == all_var_name ~ "With.all.variables",
+        TRUE ~ color_group
+      )
+    )
+
+
+  # 获取最大值用于坐标轴扩展
+  max_value <- max(long_data$value, na.rm = TRUE)
+
+
+  # 绘图
+  p <- ggplot2::ggplot(long_data, ggplot2::aes(y = bio, x = value)) +
+    # 三个geom_col部分保持不变
+    ggplot2::geom_col(
+      data = dplyr::filter(long_data, color_group == "Without"),
+      ggplot2::aes(fill = color_group),
+      width = 0.7,
+      position = ggplot2::position_nudge(y = -0.1)
+    ) +
+    ggplot2::geom_col(
+      data = dplyr::filter(long_data, color_group == "With.all.variables"),
+      ggplot2::aes(fill = color_group),
+      width = 0.7,
+      position = ggplot2::position_nudge(y = -0.1)
+    ) +
+    ggplot2::geom_col(
+      data = dplyr::filter(long_data, color_group == "With_only"),
+      ggplot2::aes(fill = color_group),
+      width = 0.7,
+      position = ggplot2::position_nudge(y = 0.1)
+    ) +
+    # 图例设置
+    ggplot2::scale_fill_manual(
+      values = c(
+        "Without" = "#00aaaa",        # 青色
+        "With_only" = "#0000FF",      # 蓝色
+        "With.all.variables" = "#FF0000"  # 红色
+      ),
+      breaks = c("With.all.variables", "Without", "With_only"),
+      labels = c("With all variables", "Without variable", "With only variable")
+    ) +
+    # 坐标轴设置
+    ggplot2::scale_x_continuous(
+      breaks = seq(0, ceiling(max_value), by = 1),
+      expand = ggplot2::expansion(mult = c(0, 0.05))
+    ) +
+    # 标签设置
+    ggplot2::labs(
+      title = title,
+      y = "Variable",
+      x = "Training gain"
+    ) +
+    # 主题设置
+    ggplot2::theme_bw() +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(hjust = 0.5),
+      axis.line = ggplot2::element_line(color = "black", linewidth = 0.5),
+      axis.ticks = ggplot2::element_line(color = "black", linewidth = 0.5),
+      axis.ticks.length = ggplot2::unit(-0.15, "cm"),
+      axis.text = ggplot2::element_text(color = "black"),
+      axis.text.y = ggplot2::element_text(size = 12),  # 减小y轴标签字号
+
+      # 调整y轴标题位置
+      axis.title.y = ggplot2::element_text(
+        margin = ggplot2::margin(r = -5, unit = "pt")  # 减少右侧空白
+      ),
+
+      panel.grid = ggplot2::element_blank(),
+      panel.border = ggplot2::element_rect(
+        colour = "black",
+        linewidth = 1.2,
+        fill = NA
+      ),
+      legend.position = c(1.03, 0.85),
+      legend.justification = c(0, 0.5),
+      plot.margin = ggplot2::margin(5, 35, 5, 5, unit = "mm"),
+      legend.key.size = ggplot2::unit(0.4, "cm"),
+      legend.text = ggplot2::element_text(size = 8),
+      legend.spacing = ggplot2::unit(0.2, "cm"),
+      legend.background = ggplot2::element_blank(),
+      legend.title = ggplot2::element_blank()
+    ) +
+    ggplot2::guides(fill = ggplot2::guide_legend(title = NULL))
+
+  # 保存图片功能
+  if (save_plot) {
+    if (is.null(output_file)) {
+      stop("当 save_plot=TRUE 时，必须指定 output_file 参数")
+    }
+
+    # 确保输出目录存在
+    output_dir <- dirname(output_file)
+    if (!dir.exists(output_dir)) {
+      dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+    }
+
+    # 保存为TIFF格式
+    ggplot2::ggsave(
+      filename = output_file,
+      plot = p,
+      device = "tiff",
+      dpi = 600,
+      compression = "lzw",  # 使用LZW压缩减小文件大小
+      units = "in",        # 使用英寸作为单位
+      width = 7,           # 默认宽度7英寸
+      height = 5           # 默认高度5英寸
+    )
+    message("图片已保存至: ", normalizePath(output_file))
+  }
+
+  return(p)
+}
